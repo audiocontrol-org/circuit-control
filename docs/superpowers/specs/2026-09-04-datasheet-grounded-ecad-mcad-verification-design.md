@@ -84,8 +84,31 @@ produces physically backwards transistors.
 potentiometer, Taiway 100DP1T8B13M2QEH toggle, Neutrik NMJ6HCD2 TRS jack,
 KC-301339 DC power jack.
 
-**Known gap:** the footswitch has no datasheet — only a photograph. It must be
-measured or sourced before it can be modelled. This blocks part of M3.
+**Enclosure**, from Hammond's official drawing (REV 25.05.2020), vendored at
+`catalog/mechanical/hammond-1590bbs/`, all mm:
+
+| | |
+|---|---|
+| External | 119.50 × 94.00 × 42.10 |
+| **Inside** | **113.48 L × 87.98 W × 37.85 H** |
+| Wall thickness | 2.25 |
+| Lid | 2.00 thick, 4 × Ø4.00 holes |
+| Fixings | 4 × 6-32 UNC, 11.00 deep |
+| Screw centres | 109.50 × 84.00 |
+
+**Footswitch**, sourced and selected by the operator: StompBox Parts 3PDT
+Footswitch PRO, SKU FSW-1032, solder lug, therefore **class C**. Dimensions
+from the vendored drawing at `catalog/switches/3pdt-stomp/`; panel hole Ø12.5,
+M12×0.75 bushing 11.5 long, and **18.7 mm of interior depth consumed** behind
+the panel.
+
+Two consequences the tool should be able to derive rather than assert:
+
+- 37.85 − 18.7 leaves **≈19.1 mm** beneath the footswitch. A board can pass
+  under it, but that is a genuine constraint on component height rather than a
+  comfortable margin.
+- A 2.25 mm wall leaves roughly 9 mm of thread inside for the nut, so the
+  standard bushing suffices and the long-bushing variant is unnecessary.
 
 ## 4. Part classes
 
@@ -623,18 +646,85 @@ measured.
 This keeps agent-sourced parts immediately useful without letting a PDF reading
 masquerade as a caliper reading.
 
+### Worked example
+
+The first sourced part, selected by the operator from a candidate list and
+already vendored at `catalog/switches/3pdt-stomp/`. It illustrates the schema
+concretely, including per-dimension provenance under §8 and the `verified`
+flag.
+
+```yaml
+id: switches/3pdt-stomp
+mpn: FSW-1032
+verified: false          # generic drawing; confirm with calipers in hand
+
+sourcing:
+  - supplier: StompBox Parts
+    sku: FSW-1032
+    url: https://stompboxparts.com/switches/3pdt-footswitch-pro-latching-solder-lug/
+    price_usd: 4.30
+
+mount: panel             # class C — not on the board
+termination: solder_lug
+
+geometry:
+  - cylinder: {id: bushing,  diameter: 12.0, length: 11.5, axis: z}
+  - cylinder: {id: actuator, diameter: 10.0, length: 5.0,  axis: z}
+  - box:      {id: body,     size: [19.6, 17.0, 15.5]}
+  - box:      {id: terminals, size: [19.6, 17.0, 3.2]}
+
+interfaces:
+  - {id: panel_axis,       type: cylindrical_axis, geometry: bushing}
+  - {id: panel_mount_face, type: planar_interface}
+
+panel:
+  hole_diameter:
+    value: 12.5
+    unit: mm
+    source:
+      type: supplier_drawing
+      document: aionfx-3pdt-stomp-switch.pdf
+      page: 1
+      drawing: Drill Dimensions
+
+dimensions:
+  bushing_thread:
+    value: M12x0.75
+    source: {type: supplier_drawing, document: aionfx-3pdt-stomp-switch.pdf,
+             page: 1, drawing: Side View}
+
+keepout:
+  clearance: 1.0
+```
+
+Every remaining dimension carries the same `source` shape. The switch consumes
+**18.7 mm** of interior depth behind the panel (15.5 body plus 3.2 terminals),
+which is the constraint that most affects PCB placement in a 1590BBS.
+
 ## 17. Open questions
 
-1. **Footswitch part selection.** No datasheet exists in `assets/` — only a
-   photograph. The standard for true bypass is a 3PDT latching (on-on)
-   footswitch, but the specific part and its mechanical dimensions must be
-   sourced, not guessed. This is the first exercise of the M2.5 loop, and the
-   resulting entry stays `unverified` until the switch is measured in hand.
-2. **SW1 mounting.** The Taiway 100DP1T8B13M2QEH is typically panel-mounted and
-   hand-wired, but SW1 appears in the schematic and so is on the board. Confirm
-   whether SW1 is board-mounted through a panel hole (class A) or panel-mounted
-   and wired (class C, with the schematic symbol carrying no footprint).
-3. **PCB mounting method.** Standoffs to the enclosure floor, or suspended on
-   pot bushings? Determines the PCB-to-world transform in `enclosure.yaml`.
-4. **KiCad `.proto` publication** for non-Python clients. Affects the timing of
-   the IPC backend, not v1.
+Per Section 16, these are **agent research tasks producing recommendations**,
+not requests for the operator to supply information. Each is resolved by
+finding a document, then putting a choice with its consequences to the
+operator.
+
+**Resolved.** *Footswitch selection* — sourced, and the operator selected the
+StompBox Parts 3PDT PRO (FSW-1032), solder lug, class C. Enters the catalog
+`unverified` until measured in hand. *Long bushing* — unnecessary; a 2.25 mm
+wall leaves ample thread.
+
+**Open, with the legwork identified:**
+
+1. **SW1 mounting.** The Taiway 100DP1T8B13M2QEH datasheet is already in the
+   operator's `assets/toggle/`, along with a vendor `.kicad_mod`. Read it,
+   determine whether the part is offered board-mount or panel-mount, and put
+   the class A / class C choice to the operator with its layout consequences.
+   Blocks the class assignment of SW1 and therefore part of M2.
+2. **PCB mounting method.** Standoffs from the lid, standoffs from the top
+   face, or suspension on pot bushings. The enclosure drawing gives bosses,
+   wall thickness and interior height; combined with the ≈19.1 mm beneath the
+   footswitch this is a solvable recommendation, not a question. Determines the
+   PCB-to-world transform in `enclosure.yaml`.
+3. **KiCad `.proto` publication** for non-Python clients. Affects the timing of
+   the IPC backend, not v1. Check the KiCad source tree and developer
+   documentation.
