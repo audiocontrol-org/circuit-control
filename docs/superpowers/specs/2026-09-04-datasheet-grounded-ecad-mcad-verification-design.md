@@ -32,14 +32,16 @@ The 3D model is evidence. **The verification contract is the product.**
 ## 2. What the user is buying
 
 The operator's stated pain, in their words, is managing component libraries,
-searching for footprints, and lining up components on a PCB against real parts
-in the real world. They are happy to do PCB layout and routing.
+searching for footprints, hunting for parts, and lining up components on a PCB
+against real parts in the real world. They are happy to do PCB layout and
+routing.
 
 This sets the product boundary precisely:
 
-- The computer owns **every footprint** and the placement of parts whose
-  position is physically determined by the enclosure.
-- The human owns **layout and routing** of everything else.
+- The computer owns **every footprint**, the placement of parts whose position
+  is physically determined by the enclosure, and **finding parts and their
+  datasheets** (Section 16).
+- The human owns **layout, routing, and circuit design**.
 
 Design decisions below are resolved in favour of that split wherever the PRD
 leaves room.
@@ -147,9 +149,9 @@ circuit-control/
 ~/work/pedals/fuzz/
 ├── schematics/v1/fuzz/               KiCad — see the ownership rule below
 └── mech/
+    ├── parts.yaml                    project parts manifest (see below)
     ├── enclosure.yaml                1590BBS + class-C placement
     ├── panel.yaml                    control positions in panel coordinates
-    ├── bindings.yaml                 RV1 → alpha-rv16af; Q1..Q4 → bc548-to92
     ├── checks.yaml                   constraints that must hold
     ├── parts/                        project-local one-offs (shadow catalog)
     └── circuit-control.lock
@@ -166,6 +168,47 @@ Total cost is a few megabytes.
 **`mech/parts/` shadows the catalog.** Adding a part must never require a
 commit to the tool repository, or library management returns as friction.
 Promotion to the catalog is a file move once a part proves out.
+
+### The project parts manifest
+
+`mech/parts.yaml` is the union of everything the project is built from, and is
+deliberately **not** derived from the schematic.
+
+A hardware project's real bill of materials is larger than its netlist. KiCad
+knows about RV1 and Q1–Q4; it will never know about the enclosure, the
+footswitch, the jacks, knobs, the LED bezel, standoffs, or hardware. Those are
+class-C parts and pure mechanical items, and they are the ones the operator
+must actually order.
+
+```yaml
+netlist:
+  - ref: RV1
+    part: potentiometers/alpha-rv16af
+  - refs: [Q1, Q2, Q3, Q4]
+    part: semiconductors/bc548-to92
+
+hardware:
+  - id: enclosure
+    part: mechanical/hammond-1590bbs
+  - id: footswitch
+    part: switches/3pdt-latching
+    qty: 1
+```
+
+The manifest owns **what**; `enclosure.yaml` owns **where**, referring to
+`hardware` entries by id. This preserves the ownership split in PRD §6 —
+component definitions own geometry, mechanical assembly definitions own
+placement.
+
+Two things fall out:
+
+- **`cctl bom`** emits an orderable bill of materials with manufacturer part
+  numbers, distributors, and quantities, covering non-netlist items that no
+  KiCad BOM export can produce.
+- **Reconciliation** — every schematic reference must appear under `netlist`,
+  and every `netlist` entry must correspond to a real symbol. Unbound
+  references are an error, which states the fixture's "76 unassigned
+  footprints" problem as a check.
 
 **Ownership rule.** The tool writes exactly four things into a KiCad project:
 
@@ -230,6 +273,11 @@ cctl sync              assign footprints, emit library, place class A, outline
 cctl build             read board, construct assembly, emit GLB
 cctl verify            evaluate constraints; non-zero exit on required failure
 cctl inspect <part>    dump a part model with provenance
+cctl bom               emit an orderable bill of materials
+cctl catalog new       scaffold a part definition
+cctl catalog datasheet vendor a datasheet PDF into the catalog
+cctl catalog check     validate a part; fails without resolvable provenance
+cctl catalog confirm   clear the unverified flag after physical measurement
 cctl catalog update    upgrade a pinned part, with dimensional diff
 cctl freeze            tag the lock against a fabrication release
 ```
@@ -450,9 +498,14 @@ Acceptance criteria 2, 3, 4, 5, 7, 9, 10, 11 hold in miniature.
 generated from the 1590BBS interior. **The operator is unblocked here** — the
 pedal can be laid out.
 
+**M2.5 — parts sourcing.** The catalog verbs from Section 16: `catalog new`,
+`catalog datasheet`, `catalog check` with the provenance gate, `catalog
+confirm`, the sourcing block in `part.yaml`, and `cctl bom`. Exercised by
+sourcing the 3PDT footswitch end to end, which is the part M3 is blocked on.
+
 **M3 — class C and clearance.** Neutrik TRS, KC-301339, footswitch, LED as
 enclosure objects. Tall-capacitor-versus-lid and board-versus-jack collision.
-Acceptance criterion 8. Blocked in part by the missing footswitch datasheet.
+Acceptance criterion 8. Depends on M2.5 for the footswitch.
 
 **M4 — catalog versioning.** Hashes, lock, `cctl catalog update` with
 dimensional diff, `cctl freeze`.
@@ -484,9 +537,70 @@ Tolerances (G8) are **recorded in `part.yaml` from v1** but not yet reasoned
 over — worst-case analysis is deferred. Recording them early avoids a schema
 migration later.
 
-## 16. Open questions
+**Additions beyond PRD §19**, both driven by operator requirements stated after
+the PRD was written: the project parts manifest with `cctl bom` (Section 6),
+and agent-driven parts sourcing with its provenance gate (Section 16). Neither
+appears in §19; both are in v1 scope.
 
-1. **Footswitch dimensions.** No datasheet exists. Measure or source before M3.
+## 16. Parts sourcing
+
+The operator's third stated pain, alongside library management and footprint
+hunting, is **parts hunting**: they want to say "find the footswitch everyone
+uses, put it in the library, add it to the project" and have that happen.
+
+NG3 permits this. It defers *automatic* datasheet extraction while explicitly
+allowing "an agent or human" to translate dimensional drawings into component
+definitions, and §16 of the PRD describes precisely that authoring loop. This
+section fills in the step before it: how the datasheet is acquired.
+
+### Division of labour
+
+**The agent does the judgment.** Identifying the canonical part, searching
+distributors, and reading a product page are knowledge and web tasks, not API
+queries. Amplified Parts and StompBox Parts have no API at all, and a
+hard-coded scraper would be fragile, unmaintainable, and — per the operator's
+standing instruction against fallbacks — a bug factory.
+
+**The tool provides verbs and the guardrail.** No scrapers ship in the binary.
+The agent uses `cctl catalog new`, `cctl catalog datasheet`, and edits
+`part.yaml`; the tool validates the result and records sourcing in a block
+carrying distributor, manufacturer part number, and URL, so reordering is one
+lookup.
+
+**The manifest, never the schematic.** A sourced part is added to
+`mech/parts.yaml`, not to `fuzz.kicad_sch`. Wiring a bypass footswitch is
+circuit design and belongs to the operator under NG4.
+
+### Provenance is a hard gate
+
+If an agent authors catalog entries, an agent can hallucinate a dimension, and
+a hallucinated dimension produces a confidently wrong PASS. That would destroy
+the premise of the whole system — §23's chain is worth nothing if any link is
+invented.
+
+`cctl catalog check` therefore enforces §8 mechanically: **every mechanically
+significant dimension must carry resolvable provenance** — a vendored document
+and a page number — or the part fails validation and will not build. This is a
+hard failure, not a lint warning.
+
+### Verification status
+
+A part whose dimensions have never been checked against the physical object is
+marked `unverified`. It builds and participates in constraints normally, but
+`cctl verify` marks every result depending on it as **provisional**.
+`cctl catalog confirm <id>` clears the flag once the part is in hand and
+measured.
+
+This keeps agent-sourced parts immediately useful without letting a PDF reading
+masquerade as a caliper reading.
+
+## 17. Open questions
+
+1. **Footswitch part selection.** No datasheet exists in `assets/` — only a
+   photograph. The standard for true bypass is a 3PDT latching (on-on)
+   footswitch, but the specific part and its mechanical dimensions must be
+   sourced, not guessed. This is the first exercise of the M2.5 loop, and the
+   resulting entry stays `unverified` until the switch is measured in hand.
 2. **SW1 mounting.** The Taiway 100DP1T8B13M2QEH is typically panel-mounted and
    hand-wired, but SW1 appears in the schematic and so is on the board. Confirm
    whether SW1 is board-mounted through a panel hole (class A) or panel-mounted
