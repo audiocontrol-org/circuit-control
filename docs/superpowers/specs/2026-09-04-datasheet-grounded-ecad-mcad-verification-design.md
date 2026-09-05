@@ -541,22 +541,29 @@ merely survivable.
 Per §9, frames must be documented and tested.
 
 ```
-world  (1590BBS interior floor, back-left corner, Y-up, right-handed, mm)
+world  (1590BBS interior floor, back-left corner, Z-up, right-handed, mm)
  ├── enclosure ── panel ── opening/interface
  ├── PCB ── footprint ── component ── interface
  └── artwork                                    (deferred, §20)
 ```
+
+**Z-up, not Y-up.** An earlier draft said Y-up, which was wrong: component
+frames express shaft and bushing axes as `axis: z`, and KiCad's board plane maps
+naturally onto world XY. A Y-up world would place the board in the XZ plane and
+put every panel normal on a different axis from the component definitions that
+describe it.
 
 The PCB's relationship to world is one explicit transform **declared by the
 operator** in `enclosure.yaml`. The tool does not infer how the board sits in
 the enclosure; it consumes the declared transform and verifies its
 consequences.
 
-**KiCad board space is millimetres with Y increasing downward.** Every
-placement crosses that handedness flip. A sign error here yields a model that
-looks plausible and is mirrored, so the flip is isolated in one function with
-dedicated tests, including a deliberately asymmetric fixture that a mirrored
-transform cannot satisfy.
+**KiCad board space is millimetres with Y increasing downward.** The board
+plane maps to world XY, so every placement crosses that handedness flip:
+`world.x = board.x`, `world.y = −board.y`, plus the declared PCB origin offset.
+A sign error here yields a model that looks plausible and is mirrored, so the
+flip is isolated in one function with dedicated tests, including a deliberately
+asymmetric fixture that a mirrored transform cannot satisfy.
 
 ## 11. Verification
 
