@@ -265,12 +265,12 @@ decision and must be represented rather than assumed.
 ```yaml
 bindings:
   - refs: [R1, R2, R3, R4, R5, R6, R7, R8]
-    package: passives/resistor-axial-din0207
+    package: passives/resistor-axial-din0207-p10.16
   - refs: [Q1, Q2, Q3, Q4]
-    package: semiconductors/to92
+    package: semiconductors/to92-inline-p2.54
     part: semiconductors/bc548          # optional purchasing identity
   - ref: RV1
-    package: potentiometers/alpha-rv16af
+    package: potentiometers/alpha-rv16af-vertical
 
 hardware:
   - id: enclosure
@@ -304,6 +304,19 @@ Three things fall out:
 - **Package assignment is explicit**, so a decision like "these caps are radial
   electrolytic and 11 mm tall" is recorded and reviewable rather than implied
   by a symbol name.
+
+**A package definition must completely determine generated copper.** `to92`
+does not: it fixes neither lead forming nor pad arrangement, and BC548 ships
+with different lead-forming assumptions. Since this system *generates*
+footprints and Section 3 treats pin ordering as safety-critical, an
+under-specified package is a silent hazard.
+
+The fix is enforcement rather than nomenclature — an under-specified
+`land_pattern:` would be exactly as broken as an under-specified `package:`.
+So `cctl catalog check` **rejects any package definition that does not fully
+determine pad geometry**: `semiconductors/to92` fails, `semiconductors/to92-inline-p2.54`
+passes. Package ids are expected to carry the distinguishing detail in their
+name for the same reason.
 
 **Ownership rule.** The tool writes exactly four things into a KiCad project:
 
@@ -371,7 +384,7 @@ cctl inspect <part>    dump a part model with provenance
 cctl bom               emit an orderable bill of materials
 cctl catalog new       scaffold a part definition
 cctl catalog datasheet vendor a datasheet PDF into the catalog
-cctl catalog check     validate a part; fails without resolvable provenance
+cctl catalog check     validate a part; fails on missing or malformed basis
 cctl catalog measure   record a physical cross-check against a specimen
 cctl catalog update    upgrade a pinned part, with dimensional diff
 cctl explain <check>   full dependency provenance for one constraint result
@@ -508,8 +521,18 @@ Stated precisely, because overclaiming here would repeat the error the
 lossless-write invariant exists to prevent: **each individual file is replaced
 atomically by rename; multi-file replacement is validated-before-any-write and
 ordered, but is not atomic across files.** POSIX offers no cross-file
-atomicity. The window is narrow and recoverable via git, and the contract says
-so rather than implying more.
+atomicity.
+
+Backup-and-restore rollback across the rename phase is deliberately **not**
+implemented. Git is the journal, the exposed window is a few renames wide, and
+that machinery earns its place only if this actually bites.
+
+But "recoverable via git" is only true if you know to look. So `sync` writes an
+**intent marker** naming the full mutation set before the first rename and
+clears it after the last. A marker found on a later invocation means a previous
+`sync` did not complete: the tool reports exactly which files were and were not
+replaced, and points at git. A partial commit is thereby detectable rather than
+merely survivable.
 
 ## 10. Coordinate frames
 
@@ -562,15 +585,21 @@ Since the tool holds the whole chain, `checks.json` records **what each number
 depends on**, by identity:
 
 ```
-constraint: C10 ↔ lid clearance
- ├─ required          1.00 mm            checks.yaml
- ├─ measured          0.41 mm
+constraint: C10 ↔ lid clearance          FAIL
+ ├─ required        1.00 mm   design_rule            default_component_clearance
+ ├─ measured        0.41 mm
  └─ dependencies
-     ├─ C10 geometry        package hash → datasheet doc hash, p.3
-     ├─ enclosure geometry  package hash → drawing doc hash, p.1
-     ├─ PCB placement       fuzz.kicad_pcb
-     └─ PCB→world           enclosure.yaml
+     ├─ C10 body height    11.0 mm   manufacturer_datasheet  doc hash, p.3
+     ├─ wire allowance     10.0 mm   assembly_allowance      project rule
+     ├─ enclosure inside   37.85 mm  manufacturer_drawing    doc hash, p.1
+     ├─ PCB placement                fuzz.kicad_pcb @ rev
+     └─ PCB→world                    operator_declared       enclosure.yaml
 ```
+
+Every number carries its basis type, so the report distinguishes a
+manufacturer-specified dimension from a project assembly allowance from an
+operator-declared transform at a glance. That vocabulary is what makes
+`cctl explain` useful rather than merely verbose.
 
 Terminal output stays terse; the dependency identities live in `checks.json`,
 and `cctl explain <check>` expands one result into the full chain.
@@ -639,9 +668,28 @@ cctl catalog update alpha-rv16af
 Semantic version numbers cannot express that; the tool can, because it holds
 both definitions and the constraint set.
 
-**`cctl freeze`** tags the lock against a fabrication release. Once a board is
-manufactured its footprints are physical fact, and §21 criterion 1 plus §8
-provenance both require reproducing exactly what was fabricated.
+### Release identity
+
+Because the manifest deliberately joins against schematic-owned values rather
+than restating them, **the lock alone cannot reproduce a fabrication state.**
+The lock pins mechanical catalog inputs; git pins the project inputs — schematic
+values, placement, `mech/*.yaml`; and the tool version determines the generated
+geometry itself.
+
+`cctl freeze` therefore records a release identity, not a lock tag:
+
+```
+fabrication release
+├── project git revision
+├── circuit-control version
+├── catalog lock hash
+└── KiCad version + board format version
+```
+
+KiCad's version is recorded rather than optional: emitted documents carry a
+format stamp (`20260206` for this fixture), and generated artifacts were
+validated by a specific `kicad-cli`. Reproducing what was fabricated means
+reproducing all four. §21 criterion 1 and §8 provenance both point here.
 
 **Deferred:** version-range resolution and conflict solving across a dependency
 graph. Parts will genuinely compose — a knob on a shaft, a drilled 1590BBS
@@ -678,29 +726,59 @@ Additional required coverage:
   fixture check.
 - `verify` does not mutate: run `verify` twice against a dirty project and
   confirm the working tree is byte-identical after each.
-- Transaction rollback: induce a failure at each stage of `sync` and confirm
-  the project is unmodified.
+- Transaction behaviour, stated to match the contract in Section 9 rather than
+  overstate it: induce failure at **every pre-commit stage** and confirm the
+  project is unmodified; induce failure **during ordered replacement** and
+  confirm the partial state is detected and reported, and recoverable via git.
 
 ### Additional acceptance criterion: drift detection
 
 PRD §21 criterion 9 covers moving a footprint until verification fails. That
 generalises into a criterion the design needs in its own right:
 
-> **Any manual modification to governed generated state — class-A placement,
-> generated footprint geometry, or the generated board outline — must either be
-> detected by `cctl verify` or lie outside the declared ownership boundary.**
+> **Any manual modification to state governed by its configured generation
+> strategy must be detected by `cctl verify`.**
+
+Phrased against the strategy rather than against a fixed list, because
+ownership is configurable: under `outline.strategy: enclosure_inset` the board
+outline is governed state and drift is a failure, while under a future
+`explicit` strategy the outline is operator-owned and editing it is not drift
+at all. The ownership model decides what counts.
 
 Without it, `sync` is authoritative only at the instant it runs, and every
 guarantee in Section 6's ownership rule decays silently from that moment.
 
 ## 14. Milestones
 
-**M1 — one part, end to end.** Alpha RV16AF only: `part.yaml` from datasheet →
-emitted `.kicad_mod` → assigned to RV1 → placed from a panel coordinate → 3D
-built → one alignment check against a 1590BBS hole → GLB, JSON, non-zero exit.
+**M1 — one part, end to end, including the failure.** RV1's pot only:
+`part.yaml` with typed bases and hashed documents → emitted `.kicad_mod` →
+assigned to RV1 → placed from an operator-declared panel coordinate → 3D built
+→ one alignment check against a 1590BBS panel hole → GLB, `checks.json`, text
+report.
+
+**Completion requires proving the negative path.** A happy path proves a
+pipeline can produce an agreeable answer; it does not prove the thesis. M1 is
+done when the fixture demonstrates:
+
+```
+source → model → generated ECAD → assembly → PASS
+                                      ↓
+                            introduce drift
+                                      ↓
+                     FAIL + non-zero exit + dependency provenance
+```
+
+Perturb the panel position or the board state, require FAIL with a non-zero
+exit, and require `cctl explain` to name the changed input. Restore, require
+PASS. At that point §23's claim holds at n=1 rather than being asserted.
 
 Exercises every component at n=1 and settles the coordinate-frame flip.
 Acceptance criteria 2, 3, 4, 5, 7, 9, 10, 11 hold in miniature.
+
+**M1 is blocked on open question 3.** It is written above as "RV1's pot" rather
+than "the Alpha RV16AF" deliberately: the fixture's pot library is an Adafruit
+5283 while the adjacent datasheet is an Alpha RV16AF, so which part RV1 *is*
+has not been established. Resolving that is agent legwork and precedes M1.
 
 **M2 — the whole board gets footprints, under lock.** All 76 symbols bound via
 `bindings`: axial resistor, disc and radial capacitor, TO-92, DO-35 packages
@@ -826,10 +904,28 @@ a hallucinated dimension produces a confidently wrong PASS. That would destroy
 the premise of the whole system — §23's chain is worth nothing if any link is
 invented.
 
-`cctl catalog check` therefore enforces §8 mechanically: **every mechanically
-significant dimension must carry resolvable provenance** — a document and a
-page — or the part fails validation and will not build. This is a hard failure,
-not a lint warning.
+But "every dimension must cite a datasheet" is the wrong gate, and the `~` in
+the worked example below is what exposes it. A wiring or service envelope
+generally *cannot* come from a manufacturer: they specify the solder lug, not
+how much room your wire gauge, strip length, solder joint, and bend radius
+consume. A design clearance of 1.0 mm is not a documentary fact either — it is
+engineering policy.
+
+An unsatisfiable gate is worse than no gate. It does not prevent invention; it
+pressures the author into attributing a legitimate engineering number to a page
+that says nothing about it. That is a *more* corrosive failure than an
+uncited number, because it looks sourced.
+
+So the gate is on **basis**, not on documents:
+
+> **Every mechanically significant numeric input must declare an explicit
+> basis.** Source-derived dimensions require resolvable documentary provenance.
+> Measurements require specimen provenance. Engineering allowances and design
+> rules must be explicitly typed and attributable. No basis may masquerade as
+> another.
+
+`cctl catalog check` enforces that a basis exists and is well-formed for its
+type. A missing or malformed basis is a hard failure, not a lint warning.
 
 ### Documents are first-class, and identified by content
 
@@ -892,24 +988,42 @@ physical_validation:
 finding in its own right. It means the document is wrong, the part is not what
 was ordered, or the specimen is counterfeit. All three are worth failing over.
 
-### Evidence class
+### Basis types are the evidence taxonomy
 
-Agreement is not the only axis; **strength of evidence** matters too, and this
-project's own first part shows why. The 3PDT is documented — by a *generic
-supplier drawing*, with no manufacturer, no MPN, and no tolerances. A
-manufacturer datasheet stating `15.5 ±0.2` is far stronger evidence. Under a
-single `documented` status, those are indistinguishable.
+Basis and "evidence class" are not two mechanisms. A number's basis *is* what
+kind of evidence stands behind it, and maintaining two parallel vocabularies
+over the same values would guarantee they drift apart. One taxonomy:
 
-PRD §8 already types the source, so evidence class is nearly free:
+| `basis.type` | Requires | Example |
+|---|---|---|
+| `manufacturer_datasheet` | document + page | body height |
+| `manufacturer_drawing` | document + page | the Hammond 1590BBS drawing |
+| `supplier_drawing` | document + page | the generic 3PDT drawing |
+| `generic_reference` | document + page | a family convention |
+| `physical_measurement` | specimen id, instrument, date | measured shaft diameter |
+| `assembly_allowance` | rationale | wiring envelope |
+| `design_rule` | named rule | default component clearance |
+| `operator_declared` | file + field | the PCB-to-world transform |
 
+**Categorical, not a total order.** A default strength ordering exists for
+reporting, but it is not baked into the model, because prestige is not
+fitness. A manufacturer datasheet that omits the dimension is worthless *for
+that dimension*; a manufacturer's dimensional drawing often beats their general
+datasheet; a distributor-hosted manufacturer drawing is still authoritative;
+and an enclosure drawing is not a "datasheet" at all.
+
+Checks therefore declare **acceptable bases** rather than a minimum rank:
+
+```yaml
+- id: shaft-to-panel-hole
+  evidence:
+    require: [manufacturer_datasheet, manufacturer_drawing, physical_measurement]
 ```
-manufacturer_datasheet  >  supplier_drawing  >  generic_reference
-```
 
-A constraint may declare a minimum class. A required clearance check demanding
-`manufacturer_datasheet` would **fail** against the current footswitch entry —
-correctly, and with a message naming the weak link rather than silently
-reporting PASS.
+Under that policy the current footswitch entry — backed by a generic supplier
+drawing with no tolerances — **fails**, naming the weak link rather than
+silently reporting PASS. Under a looser policy for a non-critical clearance, it
+passes. Fitness for the claim, decided per claim.
 
 ### Worked example
 
@@ -946,7 +1060,13 @@ geometry:                         # nominal — what the object is
   - box:      {id: terminals, size: [19.6, 17.0, 3.2]}
 
 envelope:                         # space that must remain available
-  - box: {id: wiring, size: [19.6, 17.0, ~], of: terminals}
+  - box:
+      id: wiring
+      of: terminals
+      size: [19.6, 17.0, ~]       # not yet established — see below
+      basis:
+        type: assembly_allowance
+        rationale: "22 AWG stranded, solder lug, 90° bend"
 
 interfaces:
   - {id: panel_axis,       type: cylindrical_axis, geometry: bushing}
@@ -956,11 +1076,19 @@ panel:
   hole_diameter:
     value: 12.5
     unit: mm
-    source: {document: datasheet, page: 1, drawing: Drill Dimensions}
+    basis: {type: supplier_drawing, document: datasheet, page: 1,
+            drawing: Drill Dimensions}
 
 keepouts:
-  clearance: 1.0
+  clearance:
+    value: 1.0
+    basis: {type: design_rule, rule: default_component_clearance}
 ```
+
+Three different bases appear there, and none pretends to be another: the panel
+hole is documentary, the wiring envelope is an assembly allowance with a stated
+rationale, and the clearance is project policy. Forcing the latter two through
+documentary provenance would have produced fiction.
 
 ### Nominal geometry, envelope, and keepout are distinct
 
@@ -981,9 +1109,12 @@ V1 does not implement rich envelope semantics — an envelope may simply be a
 scaled or offset primitive — but the distinction exists now so that collision
 operates on envelopes while rendering shows nominal form.
 
-The `~` above is deliberate: the wiring envelope for this switch is **not yet
-sourced**, and writing a plausible number would be exactly the invention the
-provenance gate exists to prevent.
+The `~` above is deliberate: the wiring envelope for this switch has **no
+established allowance yet**. Its basis type is known — an assembly allowance,
+not a documentary fact — but the number itself requires a decision about wire
+gauge and assembly practice that has not been made. Writing a plausible value
+would be exactly the invention the gate exists to prevent, and typing its basis
+honestly is what makes the gap visible rather than papered over.
 
 ## 17. Open questions
 
