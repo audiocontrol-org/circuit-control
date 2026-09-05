@@ -428,9 +428,11 @@ than by boolean geometry — "is this shaft concentric with that opening" is a
 dot product, not a CSG operation — so the hard non-convex cases do not arise in
 v1. Non-convex bodies, where needed, decompose into convex parts.
 
-Consequence: the operator's `164_1590BBS.stp` is **unused in v1**. The
-enclosure is modelled from Hammond's published dimensional drawing instead,
-which NG5 and §15 both prefer, and the STEP becomes a future cross-check.
+Consequence: the operator's `164_1590BBS.stp` is **not an input**. The enclosure
+is modelled from Hammond's published dimensional drawing, which NG5 and §15 both
+prefer. The STEP instead becomes a **witness** under the model cross-check in
+Section 16, landing in M6 — tessellated through `kicad-cli` rather than through
+a kernel of ours.
 
 OCCT becomes necessary for real extrusions, STEP export, and imported-versus-
 datasheet comparison — all §20 deferrals. Because no Python is permitted, that
@@ -810,6 +812,20 @@ Identity and locking already exist from M2.
 **M5 — viewer and CI.** GLB viewer page, report polish, `cctl verify` as a
 repository check (§17).
 
+**M6 — model cross-check.** Compare datasheet-grounded geometry against vendor
+STEP and mesh models on origin-invariant quantities (Section 16). Tessellation
+via `kicad-cli`, gated on a spike confirming the `--subst-models` /
+`--component-filter` / `--no-board-body` pipeline. Delivers PRD §15's
+imported-versus-datasheet comparison, which §20 had deferred.
+
+Two fixtures, both already present, and the design needs both:
+
+- **Must agree** — Hammond's `164_1590BBS.stp` against the enclosure modelled
+  from their drawing.
+- **Must be discrepant** — the discarded Adafruit `5283.stp` against the Alpha
+  RV16AF-41. A cross-check that cannot catch the mismatch actually found in the
+  fixture's `assets/` is not worth shipping.
+
 **Why M1 precedes M2**, despite M2 being what unblocks the operator: footprint
 pads and 3D geometry derive from the same `part.yaml`. Building the emitter
 across 76 symbols before anything consumes the geometry side would produce a
@@ -826,18 +842,24 @@ machine-readable verification; CLI; reproducible setup.
 
 Out, per §5 and §20: general-purpose CAD; photorealistic modelling; automatic
 datasheet extraction; PCB electrical design; bottom-side components; complex
-extrusions; STEP import and export; DXF generation; artwork and SVG
-verification; worst-case tolerance analysis; automatic footprint association;
-multiple or flex PCBs; fastener modelling.
+extrusions; STEP **export**; DXF generation; artwork and SVG verification;
+worst-case tolerance analysis; automatic footprint association; multiple or
+flex PCBs; fastener modelling.
+
+STEP **import** moves in, narrowly: not as a geometry source, but as a witness
+for the model cross-check (Section 16, M6), tessellated via `kicad-cli` rather
+than a kernel. That delivers PRD §15's imported-versus-datasheet comparison
+while leaving NG5 intact.
 
 Tolerances (G8) are **recorded in `part.yaml` from v1** but not yet reasoned
 over — worst-case analysis is deferred. Recording them early avoids a schema
 migration later.
 
-**Additions beyond PRD §19**, both driven by operator requirements stated after
+**Additions beyond PRD §19**, all driven by operator requirements stated after
 the PRD was written: the project parts manifest with `cctl bom` (Section 6),
-and agent-driven parts sourcing with its provenance gate (Section 16). Neither
-appears in §19; both are in v1 scope.
+agent-driven parts sourcing with its basis gate (Section 16), and the model
+cross-check against vendor geometry (Section 16, M6). None appears in §19; all
+are in v1 scope.
 
 ## 16. Parts sourcing
 
@@ -961,8 +983,9 @@ different names:
 
 | Claim | Question it answers |
 |---|---|
-| **provenance validation** | Is every dimension grounded in an identified document? |
+| **provenance validation** | Is every number grounded in a typed, well-formed basis? |
 | **physical validation** | Has a specimen been measured, and does it agree? |
+| **model cross-check** | Does independent vendor geometry agree? |
 | **assembly verification** | Do the constraints hold? |
 
 ### Measurement is a cross-check, not a promotion in authority
@@ -988,7 +1011,50 @@ physical_validation:
 finding in its own right. It means the document is wrong, the part is not what
 was ordered, or the specimen is counterfeit. All three are worth failing over.
 
-### Basis types are the evidence taxonomy
+### Model cross-check against vendor geometry
+
+Where a manufacturer or supplier ships a STEP or mesh model, it is an
+independent statement about the same part, and disagreement with our
+datasheet-grounded model is information worth having.
+
+**It is a witness, never a source.** NG5 forbids imported CAD silently
+overriding recorded datasheet dimensions, and PRD §2 gives the reasons: models
+may not exist, may be inaccurate, may carry arbitrary origins, may have unclear
+provenance, and may be visually detailed while mechanically wrong. The argument
+is identical to measurement-versus-datasheet — a vendor model is one party's
+rendering, while the drawing is the production specification. So the cross-check
+yields a status, never a dimension:
+
+```yaml
+model_cross_check:
+  status: unchecked | agrees | discrepant | unavailable
+```
+
+`discrepant` is a finding in its own right: either the model is wrong, the
+drawing is wrong, or the model is not the variant that was ordered.
+
+**Compare origin-invariant quantities.** §2's "model origins may be arbitrary"
+means coordinates cannot be compared directly, and general registration is a
+hard problem. It is also mostly avoidable: bounding-box extents, fitted
+cylinder diameters, and distances *between* features are all invariant to where
+the vendor put their origin. V1 compares those and does not attempt surface-level
+or best-fit registration.
+
+**No kernel is required.** Meshes parse trivially. STEP does need
+tessellation — but `kicad-cli pcb export stl` accepts `--subst-models`,
+`--component-filter <ref>` and `--no-board-body`, so a vendor STEP attached to a
+footprint on a scratch board tessellates headlessly through KiCad's own OCCT.
+That reuses the oracle Section 13 already requires rather than adding a
+dependency. The flags are confirmed; the pipeline needs a spike before M6 is
+planned in detail.
+
+**Vendor models are hashed like documents.** A supplier can silently replace a
+STEP exactly as they can a PDF, so a `models:` block carrying path, hash,
+retrieval date and source URL joins `documents:` in the part package from M1,
+even though comparison itself lands in M6.
+
+This also makes the operator's `164_1590BBS.stp` useful: not as an input, but
+as a witness against the enclosure we model from Hammond's drawing.
 
 Basis and "evidence class" are not two mechanisms. A number's basis *is* what
 kind of evidence stands behind it, and maintaining two parallel vocabularies
