@@ -102,13 +102,12 @@ from the vendored drawing at `catalog/switches/3pdt-stomp/`; panel hole Ø12.5,
 M12×0.75 bushing 11.5 long, and **18.7 mm of interior depth consumed** behind
 the panel.
 
-Two consequences the tool should be able to derive rather than assert:
-
-- 37.85 − 18.7 leaves **≈19.1 mm** beneath the footswitch. A board can pass
-  under it, but that is a genuine constraint on component height rather than a
-  comfortable margin.
-- A 2.25 mm wall leaves roughly 9 mm of thread inside for the nut, so the
-  standard bushing suffices and the long-bushing variant is unnecessary.
+**Assembly geometry is operator-specified, not inferred.** How the PCB sits in
+the enclosure — its plane, offset, and mounting method — is declared in
+`enclosure.yaml` by the operator. The tool consumes that transform and checks
+its consequences; it does not derive the arrangement. Dimensions above are
+sourced facts from vendored drawings; conclusions drawn from combining them are
+verification output, not spec content.
 
 ## 4. Part classes
 
@@ -144,12 +143,48 @@ determines where the part must be.
 ```
 
 The operator expresses position in **panel language** — the language they would
-use with a drill — and the tool solves for the board coordinates. The board
-outline is likewise generated from the enclosure interior minus clearance, not
-drawn.
+use with a drill — and the tool solves for the board coordinates.
 
 Class A placement is therefore a *derived* quantity, and G1 is honoured for
 classes B and C only. This is a deliberate, documented departure from the PRD.
+
+### Derived state is enforced, not merely produced
+
+Class-A placement now exists in two writable places: the mechanical definition
+that derives it, and the KiCad board, where the operator can drag the footprint.
+Two writable representations of one derived value require an explicit contract:
+
+> **Class-A placement, generated footprint geometry, and the generated board
+> outline are governed state.** `cctl sync` materialises them from the
+> mechanical definition. `cctl verify` fails when the checked-in KiCad state
+> differs from the derived expectation beyond tolerance.
+
+And the invariant that makes this usable in CI:
+
+> **`cctl verify` never repairs or synchronises project state.** It evaluates
+> the checked-in state against derived expectations and reports. Mutation is
+> `sync`'s job alone.
+
+`sync` materialises and repairs; `verify` detects. Verification must never
+require mutation first, or CI cannot distinguish "correct" from "just fixed".
+
+### Board outline ownership
+
+Enclosure-derived outlines are the fixture's case, not an architectural
+invariant — real boards need notches, mounting-hole avoidance, and irregular
+shapes. Ownership is declared by strategy:
+
+```yaml
+board:
+  outline:
+    strategy: enclosure_inset
+    clearance: 2.0
+```
+
+V1 implements `enclosure_inset` only. `explicit` (operator draws it, tool
+verifies fit) and `polygon` can be added later without changing ownership
+semantics, because the strategy names who owns the outline rather than assuming
+the tool does.
 
 ## 6. Repository layout and ownership
 
@@ -188,9 +223,26 @@ answerable; if the YAML ships in `circuit-control` and the PDF lives in a
 different repository, provenance breaks for anyone else cloning the catalog.
 Total cost is a few megabytes.
 
-**`mech/parts/` shadows the catalog.** Adding a part must never require a
-commit to the tool repository, or library management returns as friction.
-Promotion to the catalog is a file move once a part proves out.
+### Catalog resolution over ordered roots
+
+Adding a part must never require a commit to the tool repository, or library
+management returns as friction. But a project-local shadow that promotes into
+the tool's source tree is an odd lifecycle: the catalog is *data*, not tool
+source, and this operator intends to build many kinds of electronics projects.
+
+So the bundled catalog is **one root among several, not a privileged
+singleton**. Resolution walks ordered roots with deterministic precedence:
+
+```yaml
+catalogs:
+  - ./mech/parts          # project-local
+  - ~/work/hardware-catalog   # personal or team, optional
+  - builtin               # bundled with circuit-control
+```
+
+V1 ships the project root and the bundled root. A shared root needs no new
+architecture, only configuration, and the catalog can later move out of this
+repository without a redesign.
 
 ### The project parts manifest
 
@@ -203,35 +255,55 @@ footswitch, the jacks, knobs, the LED bezel, standoffs, or hardware. Those are
 class-C parts and pure mechanical items, and they are the ones the operator
 must actually order.
 
+**Mechanical package and purchasing identity are separate bindings.** The 23
+resistors share one mechanical package but are electrically distinct — 10K,
+100R, 8.2K, 470K, 100K, 1M. `Device:C` is likewise insufficient to determine
+ceramic disc, film, or radial electrolytic, and those differ in height, which
+is exactly what clearance checking depends on. Package classification is a real
+decision and must be represented rather than assumed.
+
 ```yaml
-netlist:
-  - ref: RV1
-    part: potentiometers/alpha-rv16af
+bindings:
+  - refs: [R1, R2, R3, R4, R5, R6, R7, R8]
+    package: passives/resistor-axial-din0207
   - refs: [Q1, Q2, Q3, Q4]
-    part: semiconductors/bc548-to92
+    package: semiconductors/to92
+    part: semiconductors/bc548          # optional purchasing identity
+  - ref: RV1
+    package: potentiometers/alpha-rv16af
 
 hardware:
   - id: enclosure
     part: mechanical/hammond-1590bbs
   - id: footswitch
-    part: switches/3pdt-latching
+    part: switches/3pdt-stomp
     qty: 1
 ```
 
+**Electrical values are never restated here.** The schematic owns them, and
+duplicating `10K` or `47uF` into the manifest would create a second writable
+copy of ECAD-owned data — precisely the manual synchronisation §23 forbids.
+`cctl bom` joins against the schematic's values at build time; any
+part-number mapping is keyed on `(symbol, value)` rather than repeating the
+value.
+
 The manifest owns **what**; `enclosure.yaml` owns **where**, referring to
-`hardware` entries by id. This preserves the ownership split in PRD §6 —
-component definitions own geometry, mechanical assembly definitions own
-placement.
+`hardware` entries by id. This preserves the ownership split in PRD §6.
 
-Two things fall out:
+Three things fall out:
 
-- **`cctl bom`** emits an orderable bill of materials with manufacturer part
-  numbers, distributors, and quantities, covering non-netlist items that no
-  KiCad BOM export can produce.
-- **Reconciliation** — every schematic reference must appear under `netlist`,
-  and every `netlist` entry must correspond to a real symbol. Unbound
-  references are an error, which states the fixture's "76 unassigned
-  footprints" problem as a check.
+- **`cctl bom`** emits a complete project bill of materials, covering
+  non-netlist items no KiCad BOM export can produce. It claims **orderability
+  only for entries carrying sourcing identity**; everything else is listed as
+  mechanical description. This keeps a mechanical verification system from
+  quietly becoming an electrical component-management system.
+- **Reconciliation** — every schematic reference must appear under `bindings`,
+  and every binding must correspond to a real symbol. Unbound references are an
+  error, which states the fixture's "76 unassigned footprints" problem as a
+  check.
+- **Package assignment is explicit**, so a decision like "these caps are radial
+  electrolytic and 11 mm tall" is recorded and reviewable rather than implied
+  by a symbol name.
 
 **Ownership rule.** The tool writes exactly four things into a KiCad project:
 
@@ -264,8 +336,8 @@ Everything else in those files belongs to the operator and is not modified.
 Components, each independently testable:
 
 - **KiCad I/O** — reads and writes KiCad documents. Behind a trait (Section 8).
-- **Catalog** — YAML to part model: pads, geometry, interfaces, keepouts,
-  provenance. Resolves `mech/parts/` over `catalog/`.
+- **Catalog** — YAML to part model: pads, geometry, envelopes, keepouts,
+  interfaces, provenance. Resolves over ordered catalog roots.
 - **Footprint emitter** — part model to `.kicad_mod`.
 - **Geometry** — primitives, transforms, coordinate frames, tessellation.
   Behind a trait (Section 8).
@@ -300,8 +372,9 @@ cctl bom               emit an orderable bill of materials
 cctl catalog new       scaffold a part definition
 cctl catalog datasheet vendor a datasheet PDF into the catalog
 cctl catalog check     validate a part; fails without resolvable provenance
-cctl catalog confirm   clear the unverified flag after physical measurement
+cctl catalog measure   record a physical cross-check against a specimen
 cctl catalog update    upgrade a pinned part, with dimensional diff
+cctl explain <check>   full dependency provenance for one constraint result
 cctl freeze            tag the lock against a fabrication release
 ```
 
@@ -369,8 +442,30 @@ published roadmap rather than hypothetical, the s-expression implementation is
 scoped as a **bridge**: it must handle the fixture's documents correctly, not
 every KiCad file ever written. Investment is bounded accordingly.
 
-Open item, not blocking v1: confirm whether KiCad publishes `.proto` files for
-non-Python clients. If not, the bridge simply lives longer.
+**Rust clients for the IPC API already exist.** The `.proto` definitions live
+in the KiCad repository as a submodule; `gitlab.com/kicad/code/kicad-rs` is an
+official KiCad-org Rust binding, and `kicad-ipc-rs` is an MIT-licensed
+alternative shipping checked-in generated protobuf so consumers need no KiCad
+checkout. The migration target is therefore concrete rather than speculative,
+which is what justifies bounding investment in the bridge.
+
+### The lossless-write invariant
+
+A generic s-expression parser and re-emitter can produce enormous diffs through
+whitespace, quoting, numeric formatting, node ordering, or version
+normalisation. Claiming the operator's data is preserved requires more than a
+fixture test:
+
+> **Any KiCad document accepted by the backend must round-trip byte-for-byte
+> when no supported mutation is requested.** Constructs the backend does not
+> understand are preserved opaquely, or the backend refuses the write.
+
+That is a backend contract, not a test case. It is what makes the ownership
+rule in Section 6 defensible rather than aspirational.
+
+The backend also records `circuit-control` in the `(generator ...)` field.
+KiCad's formats carry that field, and third-party writers are expected to
+identify themselves rather than impersonate KiCad's own generators.
 
 ## 9. KiCad write strategy
 
@@ -391,6 +486,31 @@ Two hazards git cannot cover, which the tool handles:
   If a file the tool is about to rewrite is dirty, warn and name it; `--yes`
   proceeds. Scoped to the files at risk, not the whole tree.
 
+### sync is transactional
+
+`sync` performs several dependent mutations — schematic footprint fields, the
+generated library, class-A placement, the board outline, the lock. Git provides
+rollback, but partially applied state is still a poor runtime contract: a
+failure after step two leaves a project nobody designed.
+
+Ordered contract:
+
+1. Read and validate all inputs.
+2. Compute the complete desired mutation set in memory.
+3. Evaluate all preconditions — locks, dirty files, stale lockfile.
+4. Write every output to temporary files.
+5. Validate the generated KiCad artifacts with `kicad-cli` against the
+   temporaries.
+6. Replace targets by rename.
+7. Fail without modifying the project if anything before step 6 fails.
+
+Stated precisely, because overclaiming here would repeat the error the
+lossless-write invariant exists to prevent: **each individual file is replaced
+atomically by rename; multi-file replacement is validated-before-any-write and
+ordered, but is not atomic across files.** POSIX offers no cross-file
+atomicity. The window is narrow and recoverable via git, and the contract says
+so rather than implying more.
+
 ## 10. Coordinate frames
 
 Per §9, frames must be documented and tested.
@@ -402,8 +522,10 @@ world  (1590BBS interior floor, back-left corner, Y-up, right-handed, mm)
  └── artwork                                    (deferred, §20)
 ```
 
-The PCB's relationship to world is one explicit transform declared in
-`enclosure.yaml`.
+The PCB's relationship to world is one explicit transform **declared by the
+operator** in `enclosure.yaml`. The tool does not infer how the board sits in
+the enclosure; it consumes the declared transform and verifies its
+consequences.
 
 **KiCad board space is millimetres with Y increasing downward.** Every
 placement crosses that handedness flip. A sign error here yields a model that
@@ -433,25 +555,71 @@ Clearance
 FAILED: 1 mechanical constraint
 ```
 
+### Results carry their dependency provenance
+
+A result that reports only required and measured values asks to be trusted.
+Since the tool holds the whole chain, `checks.json` records **what each number
+depends on**, by identity:
+
+```
+constraint: C10 ↔ lid clearance
+ ├─ required          1.00 mm            checks.yaml
+ ├─ measured          0.41 mm
+ └─ dependencies
+     ├─ C10 geometry        package hash → datasheet doc hash, p.3
+     ├─ enclosure geometry  package hash → drawing doc hash, p.1
+     ├─ PCB placement       fuzz.kicad_pcb
+     └─ PCB→world           enclosure.yaml
+```
+
+Terminal output stays terse; the dependency identities live in `checks.json`,
+and `cctl explain <check>` expands one result into the full chain.
+
+This is what makes §23's claim — *the verification contract is the product* —
+concrete rather than rhetorical. A PASS that cannot say why it believes its
+inputs is not a verification, and a FAIL whose provenance is opaque cannot be
+debugged.
+
 ## 12. Catalog versioning
 
 The catalog accretes, so identity must be right early.
 
-**Change severity is computed, not judged.** The footprint emitter and the
-geometry core consume disjoint fields of `part.yaml`, so classification falls
-out of the data model:
+**Change severity is computed from a declared field-to-effect table.** An
+earlier draft claimed the footprint emitter and geometry core consume disjoint
+fields, so severity fell out of the data model for free. That was wrong: pad
+positions are mechanically meaningful, courtyards are mechanical, and mounting
+holes plainly span both domains. Fields are classified by **effect**, in a
+table that is maintained deliberately and reviewed when the schema changes:
 
 | Severity | Fields | Why it matters |
 |---|---|---|
-| **fab-affecting** | pad position, pitch, drill, courtyard | Feeds copper. Physically committed once routed or fabricated; must never move silently. |
-| **mechanical-only** | body height, shaft diameter, keepout | Feeds geometry and checks. May change; consequences surface as PASS/FAIL. |
+| **fab-affecting** | anything reaching copper: pad position, pitch, drill, courtyard | Physically committed once routed or fabricated; must never move silently. Note these are *also* mechanical inputs — the classes are effects, not partitions. |
+| **mechanical-only** | body height, shaft diameter, envelope, keepout | Feeds geometry and checks alone. May change; consequences surface as PASS/FAIL. |
 | **breaking** | interface renamed or removed | `checks.yaml` references interfaces by name. Hard error naming every dangling check. |
 
-**Pinning uses content hashes.** `circuit-control.lock` records a hash of every
-part definition resolved. Any catalog edit makes the lock stale; nothing
-recomputes silently. A human-facing `version:` field exists in `part.yaml` for
-communication, but the lock keys on the hash so no one's diligence is
-load-bearing.
+A field may carry both fab-affecting and mechanical effects; severity is the
+strongest effect it has.
+
+**Pinning uses a package hash, not a file hash.** Hashing `part.yaml` alone
+leaves a hole straight through the provenance premise: the same YAML with a
+silently replaced PDF would produce the same lock entry. The lock therefore
+records a hash over the whole **mechanically meaningful package**:
+
+- `part.yaml`
+- every referenced authoritative document, by content hash
+- any declared auxiliary geometry
+- the schema/generator version
+
+A deterministic hash over the manifest plus referenced file hashes is
+sufficient; a full Merkle structure is not required. Any change within that
+package makes the lock stale, and nothing recomputes silently. A human-facing
+`version:` field exists in `part.yaml` for communication, but the lock keys on
+the hash so no one's diligence is load-bearing.
+
+One deliberate consequence: re-downloading a byte-different but
+content-equivalent PDF invalidates the lock. That is the correct default for a
+system whose premise is documentary authority, and `catalog update` shows
+exactly what changed.
 
 Upgrades are explicit, and the diff is the deliverable:
 
@@ -484,9 +652,10 @@ resolver.
 
 ## 13. Testing
 
-`kicad-cli` is headless today and is used as an **oracle**: KiCad itself
-confirms what the hand-rolled bridge writes. This is what makes a hand-rolled
-s-expression writer acceptable.
+`kicad-cli` provides **headless validation and export** operations today — not
+headless editing, per the distinction in Section 8 — and is used as an
+**oracle**: KiCad itself confirms what the hand-rolled bridge writes. This is
+what makes a hand-rolled s-expression writer acceptable.
 
 | We write | KiCad verifies |
 |---|---|
@@ -503,9 +672,26 @@ Additional required coverage:
 
 - Y-flip transform, with an asymmetric fixture (Section 10).
 - Q1–Q4 pin mapping: `Simulation_SPICE:NPN` 1/2/3 to TO-92 C/B/E.
-- Round-trip: parse then re-emit an untouched document produces no diff.
-- Acceptance criterion 9: moving a footprint far enough fails verification;
-  restoring it passes.
+- **Lossless-write invariant** (Section 8): byte-for-byte round-trip on every
+  fixture document with no mutation requested, and refusal-or-preservation on
+  constructs the backend does not model. This is a contract test, not a
+  fixture check.
+- `verify` does not mutate: run `verify` twice against a dirty project and
+  confirm the working tree is byte-identical after each.
+- Transaction rollback: induce a failure at each stage of `sync` and confirm
+  the project is unmodified.
+
+### Additional acceptance criterion: drift detection
+
+PRD §21 criterion 9 covers moving a footprint until verification fails. That
+generalises into a criterion the design needs in its own right:
+
+> **Any manual modification to governed generated state — class-A placement,
+> generated footprint geometry, or the generated board outline — must either be
+> detected by `cctl verify` or lie outside the declared ownership boundary.**
+
+Without it, `sync` is authoritative only at the instant it runs, and every
+guarantee in Section 6's ownership rule decays silently from that moment.
 
 ## 14. Milestones
 
@@ -516,22 +702,32 @@ built → one alignment check against a 1590BBS hole → GLB, JSON, non-zero exi
 Exercises every component at n=1 and settles the coordinate-frame flip.
 Acceptance criteria 2, 3, 4, 5, 7, 9, 10, 11 hold in miniature.
 
-**M2 — the whole board gets footprints.** All 76 symbols bound: `R_Axial`,
-`C_Disc`, `C_Radial`, `TO-92`, `DO-35` families plus SW1. Board outline
-generated from the 1590BBS interior. **The operator is unblocked here** — the
-pedal can be laid out.
+**M2 — the whole board gets footprints, under lock.** All 76 symbols bound via
+`bindings`: axial resistor, disc and radial capacitor, TO-92, DO-35 packages
+plus SW1. Board outline via `enclosure_inset`. **The operator is unblocked
+here** — the pedal can be laid out.
+
+M2 also carries **content identity and lock enforcement**: package hashes,
+`circuit-control.lock`, and refusal to build against a stale lock. M2 is where
+catalog data starts generating fab-affecting geometry, and that is precisely
+where reproducibility becomes load-bearing — deferring it to M4 would mean the
+first board is laid out against unpinned inputs. The upgrade *experience* stays
+in M4; only identity and enforcement move up.
 
 **M2.5 — parts sourcing.** The catalog verbs from Section 16: `catalog new`,
-`catalog datasheet`, `catalog check` with the provenance gate, `catalog
-confirm`, the sourcing block in `part.yaml`, and `cctl bom`. Exercised by
-sourcing the 3PDT footswitch end to end, which is the part M3 is blocked on.
+`catalog datasheet` with document hashing, `catalog check` with the provenance
+and evidence-class gates, `catalog measure`, the sourcing block, and
+`cctl bom`. Exercised by sourcing the 3PDT footswitch end to end, which is the
+part M3 is blocked on.
 
 **M3 — class C and clearance.** Neutrik TRS, KC-301339, footswitch, LED as
-enclosure objects. Tall-capacitor-versus-lid and board-versus-jack collision.
-Acceptance criterion 8. Depends on M2.5 for the footswitch.
+enclosure objects, using envelopes rather than nominal geometry. Component
+height versus lid, and board versus enclosure-mounted parts. Acceptance
+criterion 8. Depends on M2.5 for the footswitch.
 
-**M4 — catalog versioning.** Hashes, lock, `cctl catalog update` with
-dimensional diff, `cctl freeze`.
+**M4 — catalog upgrade experience.** `cctl catalog update` with the semantic
+dimensional diff and constraint re-evaluation, `cctl freeze`, release history.
+Identity and locking already exist from M2.
 
 **M5 — viewer and CI.** GLB viewer page, report polish, `cctl verify` as a
 repository check (§17).
@@ -631,32 +827,108 @@ the premise of the whole system — §23's chain is worth nothing if any link is
 invented.
 
 `cctl catalog check` therefore enforces §8 mechanically: **every mechanically
-significant dimension must carry resolvable provenance** — a vendored document
-and a page number — or the part fails validation and will not build. This is a
-hard failure, not a lint warning.
+significant dimension must carry resolvable provenance** — a document and a
+page — or the part fails validation and will not build. This is a hard failure,
+not a lint warning.
 
-### Verification status
+### Documents are first-class, and identified by content
 
-A part whose dimensions have never been checked against the physical object is
-marked `unverified`. It builds and participates in constraints normally, but
-`cctl verify` marks every result depending on it as **provisional**.
-`cctl catalog confirm <id>` clears the flag once the part is in hand and
-measured.
+A filename is not an identity. A supplier can silently replace a PDF while
+keeping its name, and the catalog would never notice — a hole straight through
+the premise. Documents are therefore catalog objects with content hashes:
 
-This keeps agent-sourced parts immediately useful without letting a PDF reading
-masquerade as a caliper reading.
+```yaml
+documents:
+  datasheet:
+    path: aionfx-3pdt-stomp-switch.pdf
+    sha256: <hash>
+    retrieved: 2026-09-04
+    source_url: https://aionfx.com/app/files/datasheets/aionfx-3pdt-stomp-switch.pdf
+    kind: supplier_drawing
+```
+
+Dimensions then reference the document by key, closing the chain:
+
+```
+dimension → document identity → exact bytes → external origin
+```
+
+This lands in **M1**, not later. It is cheap, and it is the difference between
+provenance that is checkable and provenance that is decorative.
+
+### Three distinct claims, three distinct names
+
+An earlier draft used `verified` for "checked against a physical specimen",
+while the whole system uses *verification* to mean evaluating an assembly
+against authoritative dimensions. Those are different claims and now have
+different names:
+
+| Claim | Question it answers |
+|---|---|
+| **provenance validation** | Is every dimension grounded in an identified document? |
+| **physical validation** | Has a specimen been measured, and does it agree? |
+| **assembly verification** | Do the constraints hold? |
+
+### Measurement is a cross-check, not a promotion in authority
+
+The earlier design had calipers outranking the datasheet. That is wrong, and
+wrong in a way that would make verification *less* sound.
+
+A specimen tells you what **one specimen** measures. A manufacturer's drawing
+tells you what the part is **specified to guarantee**. For clearance design the
+specification is the more authoritative input: if the datasheet says
+`15.5 ±0.5` and your specimen measures `15.2`, replacing 15.5 with 15.2 designs
+against a sample rather than against the production contract, and the next unit
+may be 16.0.
+
+So physical measurement records agreement; it does not replace the source:
+
+```yaml
+physical_validation:
+  status: unmeasured        # | cross_checked | discrepant
+```
+
+`discrepant` — a specimen outside the document's stated tolerance — is a
+finding in its own right. It means the document is wrong, the part is not what
+was ordered, or the specimen is counterfeit. All three are worth failing over.
+
+### Evidence class
+
+Agreement is not the only axis; **strength of evidence** matters too, and this
+project's own first part shows why. The 3PDT is documented — by a *generic
+supplier drawing*, with no manufacturer, no MPN, and no tolerances. A
+manufacturer datasheet stating `15.5 ±0.2` is far stronger evidence. Under a
+single `documented` status, those are indistinguishable.
+
+PRD §8 already types the source, so evidence class is nearly free:
+
+```
+manufacturer_datasheet  >  supplier_drawing  >  generic_reference
+```
+
+A constraint may declare a minimum class. A required clearance check demanding
+`manufacturer_datasheet` would **fail** against the current footswitch entry —
+correctly, and with a message naming the weak link rather than silently
+reporting PASS.
 
 ### Worked example
 
 The first sourced part, selected by the operator from a candidate list and
-already vendored at `catalog/switches/3pdt-stomp/`. It illustrates the schema
-concretely, including per-dimension provenance under §8 and the `verified`
-flag.
+vendored at `catalog/switches/3pdt-stomp/`.
 
 ```yaml
 id: switches/3pdt-stomp
 mpn: FSW-1032
-verified: false          # generic drawing; confirm with calipers in hand
+
+documents:
+  datasheet:
+    path: aionfx-3pdt-stomp-switch.pdf
+    sha256: <hash>
+    retrieved: 2026-09-04
+    kind: supplier_drawing        # weaker than manufacturer_datasheet
+
+physical_validation:
+  status: unmeasured
 
 sourcing:
   - supplier: StompBox Parts
@@ -664,14 +936,17 @@ sourcing:
     url: https://stompboxparts.com/switches/3pdt-footswitch-pro-latching-solder-lug/
     price_usd: 4.30
 
-mount: panel             # class C — not on the board
+mount: panel                      # class C — not on the board
 termination: solder_lug
 
-geometry:
-  - cylinder: {id: bushing,  diameter: 12.0, length: 11.5, axis: z}
-  - cylinder: {id: actuator, diameter: 10.0, length: 5.0,  axis: z}
-  - box:      {id: body,     size: [19.6, 17.0, 15.5]}
+geometry:                         # nominal — what the object is
+  - cylinder: {id: bushing,   diameter: 12.0, length: 11.5, axis: z}
+  - cylinder: {id: actuator,  diameter: 10.0, length: 5.0,  axis: z}
+  - box:      {id: body,      size: [19.6, 17.0, 15.5]}
   - box:      {id: terminals, size: [19.6, 17.0, 3.2]}
+
+envelope:                         # space that must remain available
+  - box: {id: wiring, size: [19.6, 17.0, ~], of: terminals}
 
 interfaces:
   - {id: panel_axis,       type: cylindrical_axis, geometry: bushing}
@@ -681,25 +956,34 @@ panel:
   hole_diameter:
     value: 12.5
     unit: mm
-    source:
-      type: supplier_drawing
-      document: aionfx-3pdt-stomp-switch.pdf
-      page: 1
-      drawing: Drill Dimensions
+    source: {document: datasheet, page: 1, drawing: Drill Dimensions}
 
-dimensions:
-  bushing_thread:
-    value: M12x0.75
-    source: {type: supplier_drawing, document: aionfx-3pdt-stomp-switch.pdf,
-             page: 1, drawing: Side View}
-
-keepout:
+keepouts:
   clearance: 1.0
 ```
 
-Every remaining dimension carries the same `source` shape. The switch consumes
-**18.7 mm** of interior depth behind the panel (15.5 body plus 3.2 terminals),
-which is the constraint that most affects PCB placement in a 1590BBS.
+### Nominal geometry, envelope, and keepout are distinct
+
+Collision checking exposes the difference immediately. Nine solder lugs are not
+merely a 3.2 mm box: attached wire and solder fillets consume real additional
+space, and a jack needs room to insert a plug or turn a nut. Encoding "what the
+object looks like" and "space that must remain available" as the same field
+guarantees a later schema migration.
+
+So the schema separates them from the start:
+
+- **`geometry`** — nominal form. Drives GLB rendering.
+- **`envelope`** — maximum manufacturing, installation, and service volume.
+  Drives collision and clearance.
+- **`keepouts`** — declared design clearance on top of the envelope.
+
+V1 does not implement rich envelope semantics — an envelope may simply be a
+scaled or offset primitive — but the distinction exists now so that collision
+operates on envelopes while rendering shows nominal form.
+
+The `~` above is deliberate: the wiring envelope for this switch is **not yet
+sourced**, and writing a plausible number would be exactly the invention the
+provenance gate exists to prevent.
 
 ## 17. Open questions
 
@@ -708,23 +992,30 @@ not requests for the operator to supply information. Each is resolved by
 finding a document, then putting a choice with its consequences to the
 operator.
 
-**Resolved.** *Footswitch selection* — sourced, and the operator selected the
-StompBox Parts 3PDT PRO (FSW-1032), solder lug, class C. Enters the catalog
-`unverified` until measured in hand. *Long bushing* — unnecessary; a 2.25 mm
-wall leaves ample thread.
+**Resolved.**
+
+- *Footswitch selection* — the operator selected the StompBox Parts 3PDT PRO
+  (FSW-1032), solder lug, class C, from a sourced candidate list.
+- *KiCad `.proto` publication* — published in the KiCad repository as a
+  submodule, with `gitlab.com/kicad/code/kicad-rs` an official Rust binding and
+  `kicad-ipc-rs` an MIT alternative. The Section 8 migration target is
+  concrete.
+- *Assembly geometry* — **out of scope for inference.** The operator specifies
+  the PCB-to-world transform and mounting arrangement in `enclosure.yaml`. The
+  tool verifies consequences; it does not propose the arrangement.
 
 **Open, with the legwork identified:**
 
 1. **SW1 mounting.** The Taiway 100DP1T8B13M2QEH datasheet is already in the
-   operator's `assets/toggle/`, along with a vendor `.kicad_mod`. Read it,
-   determine whether the part is offered board-mount or panel-mount, and put
-   the class A / class C choice to the operator with its layout consequences.
-   Blocks the class assignment of SW1 and therefore part of M2.
-2. **PCB mounting method.** Standoffs from the lid, standoffs from the top
-   face, or suspension on pot bushings. The enclosure drawing gives bosses,
-   wall thickness and interior height; combined with the ≈19.1 mm beneath the
-   footswitch this is a solvable recommendation, not a question. Determines the
-   PCB-to-world transform in `enclosure.yaml`.
-3. **KiCad `.proto` publication** for non-Python clients. Affects the timing of
-   the IPC backend, not v1. Check the KiCad source tree and developer
-   documentation.
+   operator's `assets/toggle/`, with a vendor `.kicad_mod`. Determine which
+   mounting variants the part is offered in and present the class A / class C
+   choice. Blocks SW1's class assignment and therefore part of M2.
+2. **Wiring envelope for solder-lug parts.** The 3PDT, jacks and DC jack all
+   terminate in lugs whose wire and solder consume space beyond nominal
+   geometry. Needs a sourced or measured figure before M3's clearance checks
+   mean anything.
+3. **Package identity for the pot.** `assets/pot/16mm/LIB_5283/` carries
+   `Manufacturer=Adafruit, PartNumber=5283` — not the Alpha RV16AF the adjacent
+   datasheet describes. Establish which part RV1 actually is before generating
+   its footprint. This is the exact class of unchecked-library mismatch the
+   tool exists to eliminate, sitting in the fixture.
