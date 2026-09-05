@@ -1134,6 +1134,13 @@ operator.
 - *Assembly geometry* — **out of scope for inference.** The operator specifies
   the PCB-to-world transform and mounting arrangement in `enclosure.yaml`. The
   tool verifies consequences; it does not propose the arrangement.
+- *RV1's identity* — the operator specified Alpha, and selected the
+  **RV16AF-41**, vertical PC-board terminals. RV1 is therefore **class A**. The
+  Adafruit 5283 library in `assets/` is discarded rather than reconciled. The
+  Taiwan Alpha 16 mm Metal Shaft Series catalog is vendored at
+  `catalog/potentiometers/alpha-rv16af-41/`, and its page 45 carries the PCB
+  mounting hole detail that fully determines generated copper — satisfying the
+  package-completeness rule in Section 6.
 
 **Open, with the legwork identified:**
 
@@ -1145,8 +1152,15 @@ operator.
    terminate in lugs whose wire and solder consume space beyond nominal
    geometry. Needs a sourced or measured figure before M3's clearance checks
    mean anything.
-3. **Package identity for the pot.** `assets/pot/16mm/LIB_5283/` carries
-   `Manufacturer=Adafruit, PartNumber=5283` — not the Alpha RV16AF the adjacent
-   datasheet describes. Establish which part RV1 actually is before generating
-   its footprint. This is the exact class of unchecked-library mismatch the
-   tool exists to eliminate, sitting in the fixture.
+3. **Canonical retrieval for the Alpha catalog.** The vendored copy came from a
+   third-party mirror (`electricdruid.net`), not `taiwanalpha.com`. The
+   document is a manufacturer datasheet and its basis type says so; the
+   `source_url` honestly records a mirror. Re-fetch from Taiwan Alpha before
+   this grounds a fabricated board, and re-hash. This is a useful demonstration
+   that document *authorship* and document *retrieval* are separate facts, both
+   recorded.
+4. **Shaft variant for RV1.** Order-code position 9 selects shaft type
+   independently of terminals: the catalog drawings show an 18-tooth splined
+   Ø6 shaft, while the Mouser-specific drawing for the `-10` showed a Ø6.35
+   variant. This affects knobs, not the footprint, so it does not block M1 —
+   but it must be settled before a knob is modelled.
