@@ -571,6 +571,35 @@ lookup.
 `mech/parts.yaml`, not to `fuzz.kicad_sch`. Wiring a bypass footswitch is
 circuit design and belongs to the operator under NG4.
 
+### Interaction model: the operator decides, the agent does the legwork
+
+A standing operator constraint, in their words: "You can ask me to choose a
+part from a list of approved suppliers, but you can't just make me do all the
+legwork. Legwork is for computers and agents."
+
+This is binding on the tool and on any agent operating it:
+
+- **Never ask the operator for part data.** Not dimensions, not manufacturer
+  part numbers, not datasheet links, not stock or pricing. Every one of those
+  is findable.
+- **Ask the operator to choose**, and present a short list of real candidates
+  with the data already gathered — supplier, part number, price, availability,
+  whether a dimensioned datasheet exists — so the decision is a judgment call,
+  not an errand.
+- **The operator makes the final call on parts**, and updates the schematic
+  with off-board parts when they choose to.
+- **The provenance gate binds the agent, never the operator.** A missing
+  dimension is the agent's problem to solve by finding the document. It must
+  never surface as a prompt asking the operator to supply the number.
+
+Approved suppliers are configured, not improvised, so searches stay inside
+sources the operator actually buys from. For this project: Amplified Parts,
+StompBox Parts, Love My Switches, Tayda, Digi-Key, Mouser.
+
+The same rule applies to open questions in this document. An unresolved
+question is an agent research task producing a recommendation, not a
+questionnaire.
+
 ### Provenance is a hard gate
 
 If an agent authors catalog entries, an agent can hallucinate a dimension, and
